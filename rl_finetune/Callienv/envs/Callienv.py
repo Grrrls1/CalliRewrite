@@ -62,8 +62,28 @@ class CalliEnv(gym.Env):
         "render_fps": 30,
     }
 
-    def __init__(self, tool, folder_path: str, output_path: str, visualize_path: str, env_num: int, env_rank:tuple, render_mode: Optional[str] = None, graph_width = 256,\
-                 screen_width = 512, canvas_width = 300, image_iter = 20, start_update = 5, update = 5, ema_gamma = 0.95): # 40 10 5
+    def __init__(
+        self,
+        tool,
+        folder_path: str,
+        output_path: str,
+        visualize_path: str,
+        env_num: int,
+        env_rank: tuple,
+        render_mode: Optional[str] = None,
+        graph_width=256,
+        screen_width=512,
+        canvas_width=300,
+        image_iter=20,
+        start_update=5,
+        update=5,
+        ema_gamma=0.95,
+        skel_datatype: Optional[str] = None,
+        smooth_action_weight=0.01,
+        smooth_theta_weight=0.02,
+        smooth_pos_weight=0.02,
+        smooth_penalty_max=0.1,
+    ):  # 40 10 5
         '''
         # modify canvas width!
         tool : class defined in tool.py
@@ -108,6 +128,14 @@ class CalliEnv(gym.Env):
         self.image_iter = image_iter
         self.start_update = start_update
         self.ema_gamma = ema_gamma
+        self.smooth_action_weight = smooth_action_weight
+        self.smooth_theta_weight = smooth_theta_weight
+        self.smooth_pos_weight = smooth_pos_weight
+        self.smooth_penalty_max = smooth_penalty_max
+        self.prev_action = None
+        self.prev_pos = None
+        self.prev_delta_pos = None
+        self.prev_theta_deg = None
 
         self.data_pool = [] # list of tuple
         ## renderer setting
@@ -137,17 +165,70 @@ class CalliEnv(gym.Env):
         self.action_space = spaces.Box(self.actlow, self.acthigh, dtype=np.float32)
         self.observation_space = spaces.Box(self.obslow, self.obshigh, dtype=np.float32)  
 
-        self.fill_skel_and_img_pool('.npy')
+        self.skel_datatype = self._resolve_skel_datatype(skel_datatype)
+        self.fill_skel_and_img_pool(self.skel_datatype)
+
+    def _resolve_skel_datatype(self, skel_datatype: Optional[str]) -> str:
+        """Return skeleton file suffix ('.npy' or '.npz') for this dataset folder."""
+        if skel_datatype is not None:
+            if not skel_datatype.startswith("."):
+                skel_datatype = "." + skel_datatype
+            if skel_datatype not in {".npy", ".npz"}:
+                raise ValueError(f"Unsupported skel_datatype={skel_datatype!r}, expected '.npy' or '.npz'.")
+            return skel_datatype
+
+        has_npz = any(name.endswith(".npz") for name in os.listdir(self.folder_path))
+        has_npy = any(name.endswith(".npy") for name in os.listdir(self.folder_path))
+        if has_npz and not has_npy:
+            return ".npz"
+        if has_npy and not has_npz:
+            return ".npy"
+        if has_npz and has_npy:
+            raise ValueError(
+                f"Both .npz and .npy exist in folder_path={self.folder_path!r}; "
+                "please pass skel_datatype explicitly."
+            )
+        raise ValueError(
+            f"No skeleton files found in folder_path={self.folder_path!r}; expected .npz or .npy."
+        )
 
     def fill_skel_and_img_pool(self, datatype):
-        self.tot = int(len(os.listdir(self.folder_path))/2)
-        delta = int(self.tot / self.env_num)
+        if self.env_num <= 0:
+            raise ValueError(f"env_num must be > 0, got {self.env_num}.")
+        if len(self.env_rank) != 2 or self.env_rank[1] <= 0:
+            raise ValueError(f"env_rank must be (start, total) with total > 0, got {self.env_rank!r}.")
+
+        png_files = [name for name in os.listdir(self.folder_path) if name.endswith(".png")]
+        skel_files = [name for name in os.listdir(self.folder_path) if name.endswith(datatype)]
+        self.tot = len(png_files)
+        if self.tot == 0:
+            raise ValueError(f"No .png files found in folder_path={self.folder_path!r}.")
+        if len(skel_files) != self.tot:
+            raise ValueError(
+                f"Expected one {datatype} skeleton for each .png in folder_path={self.folder_path!r}; "
+                f"found {self.tot} .png and {len(skel_files)} {datatype} files."
+            )
+        if self.tot % self.env_num != 0:
+            raise ValueError(
+                f"folder_path={self.folder_path!r} has {self.tot} images, but env_num={self.env_num}. "
+                "env_num must divide the number of images."
+            )
+
+        delta = self.tot // self.env_num
         self.start_idx = int(self.env_rank[0]/self.env_rank[1] * self.tot)
         self.end_idx = int((self.env_rank[0] + delta)/self.env_rank[1] * self.tot)
         self.list_num = self.end_idx - self.start_idx
+        if self.list_num <= 0:
+            raise ValueError(
+                f"Environment received an empty data slice: folder_path={self.folder_path!r}, "
+                f"env_num={self.env_num}, env_rank={self.env_rank!r}, total_images={self.tot}."
+            )
         
-        self.data_pool = [(self.folder_path+str(idx)+".png", self.folder_path+str(idx)+datatype)\
-                           for idx in range(self.start_idx, self.end_idx)]
+        self.data_pool = [
+            (os.path.join(self.folder_path, str(idx) + ".png"),
+             os.path.join(self.folder_path, str(idx) + datatype))
+            for idx in range(self.start_idx, self.end_idx)
+        ]
         
         self.control_list = [np.array([]) for z in range(self.list_num)]
         self.origin_list = [np.array([]) for z in range(self.list_num)]
@@ -253,7 +334,11 @@ class CalliEnv(gym.Env):
             next_vec_x, next_vec_y = self.state[-2], self.state[-1]
         else:
             vec = self.skel_list[self.skel_list_cnter-1] - self.skel_list[self.skel_list_cnter+1]
-            next_vec_x, next_vec_y = vec/np.linalg.norm(vec)
+            vec_norm = np.linalg.norm(vec)
+            if vec_norm < 1e-8:
+                next_vec_x, next_vec_y = self.state[-2], self.state[-1]
+            else:
+                next_vec_x, next_vec_y = vec / vec_norm
             
         ## calculate next midpoint of the tip
         delta_x = -math.sin(next_theta_prime)*next_r_prime*self.r_prime_bound
@@ -272,7 +357,13 @@ class CalliEnv(gym.Env):
             next_curv = 1
         else:
             futurevec = self.skel_list[self.skel_list_cnter+1] - self.skel_list[self.skel_list_cnter]
-            next_curv = math.sin(math.acos(np.inner(vec, futurevec)/np.linalg.norm(vec)*np.linalg.norm(futurevec))/2)
+            vec_norm = np.linalg.norm(vec)
+            future_norm = np.linalg.norm(futurevec)
+            if vec_norm < 1e-8 or future_norm < 1e-8:
+                next_curv = 0
+            else:
+                cos_curv = np.inner(vec, futurevec) / (vec_norm * future_norm)
+                next_curv = math.sin(math.acos(float(np.clip(cos_curv, -1, 1))) / 2)
         
         ## calculate dynamics (r, l, theta)
         next_r, next_l, next_theta =  self.tool.dynamics(self.state, action, next_center_in_graph,\
@@ -302,7 +393,9 @@ class CalliEnv(gym.Env):
         self.state = np.array([next_state_0, next_r, next_l, next_theta/self.theta_max,\
                                 next_curv, next_r_prime, next_vec_x, next_vec_y],dtype=np.float32)
         # calculate reward
-        reward = self.calc_reward(next_r_prime, last_r, terminated)
+        next_pos = np.array([next_x, next_y], dtype=np.float32)
+        reward = self.calc_reward(action, next_pos, next_theta, last_r, terminated)
+        self.update_smoothness_history(action, next_pos, next_theta)
         
         diff = self.counter - (self.counter // self.image_iter)*self.image_iter
 
@@ -385,6 +478,10 @@ class CalliEnv(gym.Env):
         
         self.state = [re_period, re_r, re_l, re_theta, re_curv, re_r_prime, re_vec_x, re_vec_y]
         self.state = np.array(self.state, dtype=np.float32)
+        self.prev_action = None
+        self.prev_pos = np.array(self.skel_list[0], dtype=np.float32)
+        self.prev_delta_pos = np.zeros(2, dtype=np.float32)
+        self.prev_theta_deg = float(re_theta * self.theta_max)
 
         
         '''
@@ -397,7 +494,48 @@ class CalliEnv(gym.Env):
             return self.state
         else:
             return self.state, {}
-    def calc_reward(self, next_r_prime, last_r, terminated):
+    def circular_angle_diff_deg(self, angle_a, angle_b):
+        return (float(angle_a) - float(angle_b) + 180.0) % 360.0 - 180.0
+
+    def calc_smoothness_penalty(self, action, next_pos, next_theta):
+        penalty = 0.0
+
+        if self.prev_action is not None and self.smooth_action_weight > 0:
+            action_delta = np.asarray(action, dtype=np.float32) - self.prev_action
+            penalty += self.smooth_action_weight * float(np.inner(action_delta, action_delta))
+
+        if self.prev_theta_deg is not None and self.smooth_theta_weight > 0:
+            theta_delta = self.circular_angle_diff_deg(next_theta, self.prev_theta_deg) / self.theta_max
+            penalty += self.smooth_theta_weight * float(theta_delta * theta_delta)
+
+        if self.prev_pos is not None and self.prev_delta_pos is not None and self.smooth_pos_weight > 0:
+            delta_pos = np.asarray(next_pos, dtype=np.float32) - self.prev_pos
+            accel_pos = delta_pos - self.prev_delta_pos
+            accel_scale = max(
+                np.linalg.norm(delta_pos),
+                np.linalg.norm(self.prev_delta_pos),
+                self.r_prime_bound,
+            ) + 1e-8
+            accel_norm = np.linalg.norm(accel_pos) / accel_scale
+            penalty += self.smooth_pos_weight * float(accel_norm * accel_norm)
+
+        if self.smooth_penalty_max is not None and self.smooth_penalty_max > 0:
+            penalty = min(penalty, self.smooth_penalty_max)
+
+        return penalty
+
+    def update_smoothness_history(self, action, next_pos, next_theta):
+        action = np.asarray(action, dtype=np.float32)
+        next_pos = np.asarray(next_pos, dtype=np.float32)
+        if self.prev_pos is None:
+            self.prev_delta_pos = np.zeros(2, dtype=np.float32)
+        else:
+            self.prev_delta_pos = next_pos - self.prev_pos
+        self.prev_action = action.copy()
+        self.prev_pos = next_pos.copy()
+        self.prev_theta_deg = float(next_theta)
+
+    def calc_reward(self, action, next_pos, next_theta, last_r, terminated):
         '''
         IN_STEP:
             1. stroke_size
@@ -427,6 +565,7 @@ class CalliEnv(gym.Env):
         stk_pix = np.sum(tip_ds)
         
         reward -= 0.08* (1/(math.sqrt(next_r+1e-4))-0.5/math.sqrt(self.r_max))**1.5
+        # reward -= self.calc_smoothness_penalty(action, next_pos, next_theta)
         
         ## terminate reward:
         points, cur_r = self.calc_four_points(self.state)

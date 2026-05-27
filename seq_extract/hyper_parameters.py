@@ -34,6 +34,10 @@ tf.compat.v1.app.flags.DEFINE_string(
     'data',
     '',
     'The dataset type.')
+tf.compat.v1.app.flags.DEFINE_string(
+    'phase2_init_model',
+    'new_train_phase_1',
+    'Snapshot subdirectory used to initialize train_phase_2.')
 
 
 def get_default_hparams_phase_1():

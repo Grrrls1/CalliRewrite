@@ -1,0 +1,57 @@
+# Franka Robot Configuration for CalliRewrite
+# =============================================
+
+# Robot Connection
+robot_ip: "172.16.0.2"  # Change to your robot's IP address
+timeout: 5.0            # Connection timeout in seconds
+
+# Motion Parameters
+default_speed: 0.05          # Speed factor (0.0-1.0), slower is safer
+default_acceleration: 0.05   # Acceleration factor (0.0-1.0)
+
+# Workspace Definition
+# Define the center of your writing surface in robot base frame coordinates
+workspace_center:
+  x: 0.668    # meters from robot base (forward)
+  y: 0.0443    # meters from robot base (left/right)
+  z: 0.2331    # meters from robot base (height of paper surface)
+
+# Surface orientation for RoboControl2.py
+# Vectors are expressed in the robot base frame. Defaults below describe
+# horizontal paper, with the tool's local +Z axis pointing toward the pen tip.
+paper_orientation:
+  normal: {x: 0.0, y: 0.0, z: 1.0}    # upward normal of the paper plane
+  x_axis: {x: 1.0, y: 0.0, z: 0.0}    # direction to keep as the tool X axis
+  tool_z_points_toward_paper: true     # false if the holder is mounted reversed
+
+# Safety Limits (relative to workspace_center)
+safety:
+  max_xy_range: 0.15   # Maximum deviation in X/Y (±15cm)
+  max_z_range: 0.10    # Maximum deviation in Z (±10cm)
+
+# Calligraphy-specific Settings
+calligraphy:
+  # Pen holder configuration
+  use_gripper: false   # Set to false if using a pen holder end-effector
+
+  # Trajectory execution
+  wait_time: 0.01      # Time between trajectory points (seconds)
+
+  # Pressure control
+  z_offset: -0.09      # Z offset for paper height (calibrate this!)
+
+# Tool-specific calibration
+# Copy your calibration function parameters here
+tool_calibration:
+  tool_type: "brush"   # "brush", "fude", or "marker"
+
+  # Example calibration parameters (from fit_calibration_function)
+  brush_params:
+    x0: 7.72667536e-04
+    x1: 1.78125854e-03
+    x2: 2.45866277e-03
+    y0: 4.34974603e-03
+    y1: 2.79805600e-03
+    y2: -1.28534957e-03
+    k0: -5.9701493
+    k1: -2.37843574

@@ -1,0 +1,15 @@
+# MuJoCo Simulation Requirements
+
+# Core dependencies
+mujoco>=3.0.0
+numpy>=1.20.0
+opencv-python>=4.5.0
+matplotlib>=3.3.0
+
+# Optional: for video recording
+imageio>=2.9.0
+imageio-ffmpeg>=0.4.0
+
+# Optional: for advanced features
+scipy>=1.7.0
+pillow>=8.0.0

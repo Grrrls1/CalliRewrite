@@ -11,7 +11,7 @@ from hyper_parameters import FLAGS, get_default_hparams_phase_2
 from utils import create_summary, save_model, reset_graph, load_checkpoint
 from dataset_utils import load_dataset_training
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '8'
+os.environ.setdefault('CUDA_VISIBLE_DEVICES', '8')
 
 tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.INFO)
 tf.compat.v1.disable_eager_execution()
@@ -300,11 +300,11 @@ def trainer(model_params):
     sess = tf.compat.v1.InteractiveSession(config=tfconfig)
     sess.run(tf.compat.v1.global_variables_initializer())
 
-    model_base_dir = 'outputs/snapshot'
-    model_name = 'new_train_phase_1'
+    model_base_dir = FLAGS.snapshot_root
+    model_name = FLAGS.phase2_init_model
     model_dir = os.path.join(model_base_dir, model_name)
     snapshot_step = load_checkpoint(sess, model_dir)
-    print('snapshot_step', snapshot_step)
+    print('Loaded init model {}, snapshot_step {}'.format(model_name, snapshot_step))
 
     load_checkpoint(sess, FLAGS.neural_renderer_path, ras_only=True)
     if train_model_params['raster_loss_base_type'] == 'perceptual':

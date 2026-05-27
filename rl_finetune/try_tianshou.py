@@ -68,6 +68,12 @@ def parse_args():
     ## both img and skel are in the same folder
     parser.add_argument('--train_data_dir',  default=None, type=str)
     parser.add_argument('--test_data_dir',  default=None, type=str)
+    parser.add_argument(
+        '--skel_datatype',
+        default=None,
+        type=str,
+        help="Skeleton file extension in data dirs: 'npy' or 'npz'. If omitted, auto-detect in CalliEnv.",
+    )
 
     # save dirs
     parser.add_argument('--save_video_dir', default='./result/demo/', type=str)
@@ -86,6 +92,10 @@ def parse_args():
     parser.add_argument('--image_iter', default=10, type=int)
     parser.add_argument('--start_update', default=1, type=int)
     parser.add_argument('--update', default=1, type=int)
+    parser.add_argument('--smooth_action_weight', default=0.01, type=float)
+    parser.add_argument('--smooth_theta_weight', default=0.02, type=float)
+    parser.add_argument('--smooth_pos_weight', default=0.02, type=float)
+    parser.add_argument('--smooth_penalty_max', default=0.1, type=float)
     
 
     parser.add_argument('--max_epoch',  default=150, type=int)
@@ -103,6 +113,31 @@ def parse_args():
     args, unknown = parser.parse_known_args()
     
     return args
+
+
+def validate_positive_int(name, value):
+    if value <= 0:
+        raise ValueError(f"{name} must be > 0, got {value}.")
+
+
+def validate_data_dir(name, data_dir):
+    if data_dir is None:
+        raise ValueError(f"--{name}_data_dir is required.")
+    if not os.path.isdir(data_dir):
+        raise FileNotFoundError(f"--{name}_data_dir does not exist or is not a directory: {data_dir!r}")
+
+
+def validate_data_split(name, data_dir, image_num, env_num):
+    if image_num <= 0:
+        raise ValueError(
+            f"--{name}_data_dir={data_dir!r} contains no .png files. "
+            "Expected matching numbered .png skeleton pairs."
+        )
+    if image_num % env_num != 0:
+        raise ValueError(
+            f"--{name}_data_dir={data_dir!r} has {image_num} images, but --{name}_env_num={env_num}. "
+            f"The env count must divide the image count; use --{name}_env_num 1 for this dataset."
+        )
     
 
 args = parse_args()
@@ -146,8 +181,22 @@ elif args.which_tool == 'marker':
                                 tp["theta_min"], tp["theta_max"],
                                 tp["theta_step"])
 
+validate_data_dir("train", args.train_data_dir)
+validate_data_dir("test", args.test_data_dir)
 train_img_num = utils.count_file_num(args.train_data_dir)
 test_img_num = utils.count_file_num(args.test_data_dir)
+validate_positive_int("--train_env_num", args.train_env_num)
+validate_positive_int("--test_env_num", args.test_env_num)
+validate_positive_int("--image_iter", args.image_iter)
+validate_positive_int("--update", args.update)
+validate_positive_int("--step_per_collect", args.step_per_collect)
+validate_positive_int("--step_per_epoch", args.step_per_epoch)
+validate_positive_int("--batch_size", args.batch_size)
+validate_positive_int("--episode_per_test", args.episode_per_test)
+validate_data_split("train", args.train_data_dir, train_img_num, args.train_env_num)
+validate_data_split("test", args.test_data_dir, test_img_num, args.test_env_num)
+print(f"train images: {train_img_num}, train envs: {args.train_env_num}")
+print(f"test images: {test_img_num}, test envs: {args.test_env_num}")
 env = gym.make('CalliEnv-v0',tool = tool,
                 folder_path = args.train_data_dir,
                 env_num = 1,
@@ -155,6 +204,11 @@ env = gym.make('CalliEnv-v0',tool = tool,
                 render_mode = args.train_render_mode,
                 output_path = args.save_control_dir,
                 visualize_path = None,
+                skel_datatype = args.skel_datatype,
+                smooth_action_weight=args.smooth_action_weight,
+                smooth_theta_weight=args.smooth_theta_weight,
+                smooth_pos_weight=args.smooth_pos_weight,
+                smooth_penalty_max=args.smooth_penalty_max,
                 new_step_api = True)
 
 print("make train envs...")
@@ -170,6 +224,11 @@ train_envs = SubprocVectorEnv([lambda i=i: RecordVideo(
                                             start_update = args.start_update,
                                             update = args.update,
                                             ema_gamma = 0.9,
+                                            skel_datatype = args.skel_datatype,
+                                            smooth_action_weight=args.smooth_action_weight,
+                                            smooth_theta_weight=args.smooth_theta_weight,
+                                            smooth_pos_weight=args.smooth_pos_weight,
+                                            smooth_penalty_max=args.smooth_penalty_max,
                                             new_step_api = True),
                                         video_folder= save_video_dir,
                                         name_prefix= 'trainvids_'+str(i),
@@ -188,6 +247,11 @@ test_envs = DummyVectorEnv([lambda i=i: RecordVideo(
                                             start_update = args.start_update,
                                             update = args.update,
                                             ema_gamma = 0.9,
+                                            skel_datatype = args.skel_datatype,
+                                            smooth_action_weight=args.smooth_action_weight,
+                                            smooth_theta_weight=args.smooth_theta_weight,
+                                            smooth_pos_weight=args.smooth_pos_weight,
+                                            smooth_penalty_max=args.smooth_penalty_max,
                                             new_step_api = True),
                                         video_folder= save_video_dir,
                                         name_prefix= 'testvids_'+str(i),
@@ -299,4 +363,15 @@ policy.eval()
 collector = Collector(policy, test_envs, exploration_noise=True)
 result = test_collector.collect(n_episode=1, render=1/30)
 
+'''
 
+python try_tianshou.py \
+  --train_data_dir data/train_data/ \
+  --test_data_dir data/test_data/ \
+  --train_env_num 3 \
+  --test_env_num 3 \
+  --which_tool brush \
+  --tool_property_dir tool_property/brush.json \
+  --logdir result/output.log
+
+'''

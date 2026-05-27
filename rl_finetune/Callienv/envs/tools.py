@@ -107,13 +107,19 @@ class Writing_Brush(Tool_Base):
         ''' angle dynamics for virtual brush
             angle difference: differences between skelecton angle and previous angle.
         '''
-        sign1 = np.cross(angle_vec, skel_vec)
-        sign1 = sign1/abs(sign1)
-        cos_sim = np.inner(angle_vec,skel_vec)/(np.linalg.norm(angle_vec)* np.linalg.norm(skel_vec))
-        if cos_sim >=1:
-            cos_sim = 1-1e-4
-        if cos_sim<1:
-            cos_sim = -1+1e-4
+        angle_norm = np.linalg.norm(angle_vec)
+        skel_norm = np.linalg.norm(skel_vec)
+        if angle_norm < 1e-8 or skel_norm < 1e-8:
+            return angle * self.theta_max, {}
+
+        cross = np.cross(angle_vec, skel_vec)
+        if abs(cross) < 1e-8:
+            sign1 = 1 if angle_difference >= 0 else -1
+        else:
+            sign1 = cross / abs(cross)
+
+        cos_sim = np.inner(angle_vec, skel_vec) / (angle_norm * skel_norm)
+        cos_sim = float(np.clip(cos_sim, -1 + 1e-4, 1 - 1e-4))
         sim = math.sqrt(1-cos_sim**2) #sin_sim
 
         ## modify in april: 3 step: [1, 0.707]: phase 1; [0.707, -0.966] phase 2; [-0.966, -1] phase 3

@@ -56,13 +56,23 @@ def load_checkpoint(sess, checkpoint_path, ras_only=False, perceptual_only=False
                         and 'global_step' not in var.op.name
                         and 'CNN_ENC_0' not in var.op.name
                         }
-    restorer = tf.compat.v1.train.Saver(load_var)
     if not ras_only:
         ckpt = tf.train.get_checkpoint_state(checkpoint_path)
         model_checkpoint_path = ckpt.model_checkpoint_path
     else:
         model_checkpoint_path = checkpoint_path
 
+    ckpt_vars = {name for name, _ in tf.train.list_variables(model_checkpoint_path)}
+    matched_var = {name: var for name, var in load_var.items() if name in ckpt_vars}
+    missing_var_num = len(load_var) - len(matched_var)
+    if missing_var_num > 0:
+        print('Warning: {} variables are missing in checkpoint {} and will be skipped.'.format(
+            missing_var_num, model_checkpoint_path))
+    if len(matched_var) == 0:
+        print('Warning: no matched variables found for {}, skip loading.'.format(checkpoint_path))
+        return '0'
+
+    restorer = tf.compat.v1.train.Saver(matched_var)
     print('Loading model %s' % model_checkpoint_path)
     restorer.restore(sess, model_checkpoint_path)
     snapshot_step = model_checkpoint_path[model_checkpoint_path.rfind('-') + 1:]

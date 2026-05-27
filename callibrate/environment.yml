@@ -1,0 +1,21 @@
+name: calli
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - numpy>=1.24,<2
+  - scipy
+  - matplotlib
+  - pyyaml
+  - imageio
+  - imageio-ffmpeg
+  - pip:
+      - opencv-python>=4.8,<5
+      - scikit-image>=0.21
+      - mujoco>=3.0
+      - pillow>=10
+      # Franka control libraries (install whichever your setup supports)
+      - frankx
+      - franky

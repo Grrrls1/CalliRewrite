@@ -16,9 +16,15 @@ if __name__ == '__main__':
     assert args.sample > 0
     print(args.input)
     for filename in os.listdir(args.input):
-        if 'png' in filename:
+        if 'jpg' in filename:
             main(args.model, args.input + '/' + filename, args.sample)
+        elif 'png' in filename:
+            main(args.model, args.input + '/' + filename, args.sample)    
     end_time_point = time.time()
     print(end_time_point - start_time_point)
 
     # main(args.model, args.input, args.sample)K,
+'''
+python ./test.py --input input --model new_train_phase_2
+
+'''

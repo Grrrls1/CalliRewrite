@@ -717,8 +717,8 @@ def load_dataset_gb(dataset_base_dir, model_params):
 
         train_split_txt_save_path = os.path.join(database, 'train.txt')
         val_split_txt_save_path = os.path.join(database, 'val.txt')
-        celeba_train_txt = np.loadtxt(train_split_txt_save_path, dtype=str)
-        celeba_val_txt = np.loadtxt(val_split_txt_save_path, dtype=str)
+        celeba_train_txt = np.atleast_1d(np.loadtxt(train_split_txt_save_path, dtype=str))
+        celeba_val_txt = np.atleast_1d(np.loadtxt(val_split_txt_save_path, dtype=str))
         splits_indices_map = {'train': celeba_train_txt, 'val': celeba_val_txt}
 
         for split in splits:
