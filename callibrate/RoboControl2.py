@@ -124,6 +124,54 @@ def _zyx_angles_from_matrix(rotation: np.ndarray) -> Tuple[float, float, float]:
     return float(z_angle), float(y_angle), float(x_angle)
 
 
+def _corner_speed_scale(points: np.ndarray, index: int, min_scale: float = 0.2) -> float:
+    """Reduce waypoint speed at sharp corners."""
+    prev_vec = points[index] - points[index - 1]
+    next_vec = points[index + 1] - points[index]
+    prev_norm = float(np.linalg.norm(prev_vec))
+    next_norm = float(np.linalg.norm(next_vec))
+    if prev_norm < 1e-9 or next_norm < 1e-9:
+        return 0.0
+
+    cos_angle = float(np.clip(np.dot(prev_vec, next_vec) / (prev_norm * next_norm), -1.0, 1.0))
+    return max(float(min_scale), 0.5 * (1.0 + cos_angle))
+
+
+def compute_tangent_velocities(
+    points: np.ndarray,
+    pen_down: np.ndarray,
+    write_speed: float,
+    lift_speed: float,
+) -> np.ndarray:
+    """
+    Compute Cartesian tangent velocities for waypoint motion.
+
+    Intermediate points get a path-tangent velocity. Start/end points and pen
+    state transitions are zero-velocity waypoints so strokes do not drag across
+    pen-up/down boundaries.
+    """
+    points = np.asarray(points, dtype=float)
+    pen_down = np.asarray(pen_down, dtype=bool)
+    velocities = np.zeros_like(points)
+    if len(points) < 3:
+        return velocities
+
+    for index in range(1, len(points) - 1):
+        if pen_down[index - 1] != pen_down[index] or pen_down[index] != pen_down[index + 1]:
+            continue
+
+        tangent = points[index + 1] - points[index - 1]
+        norm = float(np.linalg.norm(tangent))
+        if norm < 1e-9:
+            continue
+
+        base_speed = write_speed if pen_down[index] else lift_speed
+        scale = _corner_speed_scale(points, index)
+        velocities[index] = base_speed * scale * tangent / norm
+
+    return velocities
+
+
 class FrankaCalligraphyController(_BaseController):
     """
     Franka controller whose tool axis remains normal to the writing surface.
@@ -282,13 +330,83 @@ class FrankaCalligraphyController(_BaseController):
             points[:, 0], points[:, 1], points[:, 2], speed=speed, wait_time=wait_time
         )
 
+    def execute_surface_waypoint_trajectory(
+        self,
+        x_points: np.ndarray,
+        y_points: np.ndarray,
+        z_points: np.ndarray,
+        dynamics_factor: float = 0.05,
+        write_speed: float = 0.02,
+        lift_speed: float = 0.04,
+        center_xy: bool = True,
+    ) -> bool:
+        """Execute a paper-frame trajectory as one franky CartesianWaypointMotion."""
+        self._check_connected()
+        if self._library != "franky":
+            print("Waypoint velocity execution requires franky; falling back to point moves.")
+            return self.execute_surface_trajectory(
+                x_points, y_points, z_points, speed=dynamics_factor, wait_time=0.0, center_xy=center_xy
+            )
+
+        x_points = np.asarray(x_points, dtype=float)
+        y_points = np.asarray(y_points, dtype=float)
+        z_points = np.asarray(z_points, dtype=float)
+        if center_xy:
+            x_points = x_points - (x_points.min() + x_points.max()) / 2.0
+            y_points = y_points - (y_points.min() + y_points.max()) / 2.0
+
+        paper_points = np.column_stack([x_points, y_points, z_points])
+        pen_down = z_points < 0.0
+        robot_points = np.asarray([self.paper_to_robot(x, y, z) for x, y, z in paper_points])
+        velocities = compute_tangent_velocities(robot_points, pen_down, write_speed, lift_speed)
+
+        try:
+            from franky import (
+                Affine,
+                CartesianState,
+                CartesianWaypoint,
+                CartesianWaypointMotion,
+                RobotPose,
+                RobotVelocity,
+                Twist,
+            )
+
+            waypoints = []
+            zero_angular = [0.0, 0.0, 0.0]
+            for point, velocity in zip(robot_points, velocities):
+                pose = RobotPose(Affine(point.tolist(), self.target_quaternion_xyzw.tolist()))
+                twist = Twist(velocity.tolist(), zero_angular)
+                state = CartesianState(pose, RobotVelocity(twist))
+                waypoints.append(CartesianWaypoint(state))
+
+            print(
+                f"Executing franky CartesianWaypointMotion with {len(waypoints)} waypoints "
+                f"(write_speed={write_speed:.3f} m/s, lift_speed={lift_speed:.3f} m/s)"
+            )
+            old_speed = self._robot.relative_dynamics_factor
+            self._robot.relative_dynamics_factor = dynamics_factor
+            try:
+                self._robot.move(CartesianWaypointMotion(waypoints))
+            finally:
+                self._robot.relative_dynamics_factor = old_speed
+            return True
+        except Exception as exc:
+            print(f"Waypoint motion failed: {exc}")
+            return False
+
     def move_to_home(self) -> bool:
         """Move 10 cm away from the paper along its measured normal."""
         print("Moving to home position above the paper surface...")
-        return self.move_surface(0.0, 0.0, 0.10, speed=0.15)
+        return self.move_surface(0.0, 0.0, 0.10, speed=0.02)
 
 
-def Control(npz_path: str, robot_ip: Optional[str] = None, speed: float = 0.05) -> bool:
+def Control(
+    npz_path: str,
+    robot_ip: Optional[str] = None,
+    speed: float = 0.05,
+    write_speed: float = 0.02,
+    lift_speed: float = 0.04,
+) -> bool:
     """Execute an NPZ trajectory with the end-effector normal to the paper."""
     print("\n" + "=" * 70)
     print("FRANKA CALLIGRAPHY CONTROL 2 - PAPER-NORMAL END EFFECTOR")
@@ -337,7 +455,14 @@ def Control(npz_path: str, robot_ip: Optional[str] = None, speed: float = 0.05) 
         time.sleep(1)
 
         print("\nStarting calligraphy execution...")
-        success = controller.execute_surface_trajectory(x, y, z, speed=speed)
+        success = controller.execute_surface_waypoint_trajectory(
+            x,
+            y,
+            z,
+            dynamics_factor=speed,
+            write_speed=write_speed,
+            lift_speed=lift_speed,
+        )
         if success:
             print("\nReturning above the writing surface...")
             controller.move_to_home()
@@ -374,6 +499,8 @@ def execute_npz_on_controller(
     controller: FrankaCalligraphyController,
     npz_path: str,
     speed: float,
+    write_speed: float = 0.02,
+    lift_speed: float = 0.04,
     x_offset: float = 0.0,
     center_xy: bool = True,
 ) -> bool:
@@ -397,11 +524,14 @@ def execute_npz_on_controller(
         y = y - (y.min() + y.max()) / 2.0
     x = x + float(x_offset)
 
-    points = np.asarray(
-        [controller.paper_to_robot(px, py, pz) for px, py, pz in zip(x, y, z)]
-    )
-    return controller.execute_trajectory(
-        points[:, 0], points[:, 1], points[:, 2], speed=speed, wait_time=0.01
+    return controller.execute_surface_waypoint_trajectory(
+        x,
+        y,
+        z,
+        dynamics_factor=speed,
+        write_speed=write_speed,
+        lift_speed=lift_speed,
+        center_xy=False,
     )
 
 
@@ -409,6 +539,8 @@ def ControlMany(
     npz_paths: Sequence[str],
     robot_ip: Optional[str] = None,
     speed: float = 0.05,
+    write_speed: float = 0.02,
+    lift_speed: float = 0.04,
     spacing_m: float = 0.0,
     home_between: bool = False,
 ) -> bool:
@@ -424,6 +556,8 @@ def ControlMany(
     print(f"Platform: {platform.system()}")
     print(f"Files: {len(npz_paths)}")
     print(f"Speed: {speed:.3f}")
+    print(f"Write velocity: {write_speed:.3f} m/s")
+    print(f"Lift velocity: {lift_speed:.3f} m/s")
     if spacing_m:
         print(f"Spacing: {spacing_m * 1000:.1f} mm")
 
@@ -452,7 +586,14 @@ def ControlMany(
             print("\n" + "-" * 70)
             print(f"Sequence {index + 1}/{len(npz_paths)}")
             x_offset = index * float(spacing_m)
-            if not execute_npz_on_controller(controller, npz_path, speed, x_offset=x_offset):
+            if not execute_npz_on_controller(
+                controller,
+                npz_path,
+                speed,
+                write_speed=write_speed,
+                lift_speed=lift_speed,
+                x_offset=x_offset,
+            ):
                 return False
             if home_between and index < len(npz_paths) - 1:
                 print("\nMoving above the writing surface before next NPZ...")
@@ -501,6 +642,18 @@ if __name__ == "__main__":
     parser.add_argument("--robot-ip", dest="robot_ip", default=None)
     parser.add_argument("--speed", type=float, default=None)
     parser.add_argument(
+        "--write-speed",
+        type=float,
+        default=0.02,
+        help="Tangent velocity for pen-down waypoints in m/s.",
+    )
+    parser.add_argument(
+        "--lift-speed",
+        type=float,
+        default=0.04,
+        help="Tangent velocity for pen-up waypoints in m/s.",
+    )
+    parser.add_argument(
         "--spacing-mm",
         type=float,
         default=0.0,
@@ -538,6 +691,8 @@ if __name__ == "__main__":
         npz_paths,
         robot_ip=robot_ip,
         speed=motion_speed,
+        write_speed=parsed.write_speed,
+        lift_speed=parsed.lift_speed,
         spacing_m=parsed.spacing_mm / 1000.0,
         home_between=parsed.home_between,
     )
