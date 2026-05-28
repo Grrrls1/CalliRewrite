@@ -352,6 +352,126 @@ def Control(npz_path: str, robot_ip: Optional[str] = None, speed: float = 0.05) 
         print("=" * 70 + "\n")
 
 
+def load_npz_trajectory(npz_path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load one NPZ trajectory and validate required fields."""
+    if not Path(npz_path).exists():
+        raise FileNotFoundError(f"File not found: {npz_path}")
+
+    data = np.load(npz_path)
+    try:
+        x = np.asarray(data["pos_3d_x"], dtype=float)
+        y = np.asarray(data["pos_3d_y"], dtype=float)
+        z = np.asarray(data["pos_3d_z"], dtype=float)
+    except KeyError as exc:
+        raise KeyError(f"missing trajectory field in {npz_path}: {exc}") from exc
+
+    if len(x) == 0 or len(x) != len(y) or len(y) != len(z):
+        raise ValueError(f"invalid trajectory lengths in {npz_path}")
+    return x, y, z
+
+
+def execute_npz_on_controller(
+    controller: FrankaCalligraphyController,
+    npz_path: str,
+    speed: float,
+    x_offset: float = 0.0,
+    center_xy: bool = True,
+) -> bool:
+    """Execute one NPZ on an already-connected controller."""
+    try:
+        x, y, z = load_npz_trajectory(npz_path)
+    except Exception as exc:
+        print(f"Error loading {npz_path}: {exc}")
+        return False
+
+    print(f"\nLoading trajectory: {npz_path}")
+    print(f"   Points: {len(x)}")
+    print(f"   X range: [{x.min():.4f}, {x.max():.4f}] m")
+    print(f"   Y range: [{y.min():.4f}, {y.max():.4f}] m")
+    print(f"   Z range: [{z.min():.4f}, {z.max():.4f}] m")
+    if x_offset:
+        print(f"   Sequence X offset: {x_offset * 1000:.1f} mm")
+
+    if center_xy:
+        x = x - (x.min() + x.max()) / 2.0
+        y = y - (y.min() + y.max()) / 2.0
+    x = x + float(x_offset)
+
+    points = np.asarray(
+        [controller.paper_to_robot(px, py, pz) for px, py, pz in zip(x, y, z)]
+    )
+    return controller.execute_trajectory(
+        points[:, 0], points[:, 1], points[:, 2], speed=speed, wait_time=0.01
+    )
+
+
+def ControlMany(
+    npz_paths: Sequence[str],
+    robot_ip: Optional[str] = None,
+    speed: float = 0.05,
+    spacing_m: float = 0.0,
+    home_between: bool = False,
+) -> bool:
+    """Execute multiple NPZ trajectories in one robot session."""
+    if not npz_paths:
+        print("Error: no NPZ files provided")
+        return False
+
+    print("\n" + "=" * 70)
+    print("FRANKA CALLIGRAPHY CONTROL 2 - MULTI NPZ SEQUENCE")
+    print("=" * 70)
+    print(f"Python environment: {platform.architecture()}")
+    print(f"Platform: {platform.system()}")
+    print(f"Files: {len(npz_paths)}")
+    print(f"Speed: {speed:.3f}")
+    if spacing_m:
+        print(f"Spacing: {spacing_m * 1000:.1f} mm")
+
+    cfg = _load_franka_config()
+    workspace_center = _workspace_center_from_config(cfg) or (0.4, 0.0, 0.3)
+    if robot_ip is None:
+        robot_ip = str(cfg.get("robot_ip", "172.16.0.2"))
+
+    controller = FrankaCalligraphyController(
+        robot_ip=robot_ip,
+        default_speed=speed,
+        workspace_center=workspace_center,
+        use_gripper=False,
+    )
+    if not controller.connect():
+        print("Failed to connect to robot")
+        return False
+
+    try:
+        print("\nMoving above the writing surface and applying target orientation...")
+        if not controller.move_to_home():
+            return False
+        time.sleep(1)
+
+        for index, npz_path in enumerate(npz_paths):
+            print("\n" + "-" * 70)
+            print(f"Sequence {index + 1}/{len(npz_paths)}")
+            x_offset = index * float(spacing_m)
+            if not execute_npz_on_controller(controller, npz_path, speed, x_offset=x_offset):
+                return False
+            if home_between and index < len(npz_paths) - 1:
+                print("\nMoving above the writing surface before next NPZ...")
+                if not controller.move_to_home():
+                    return False
+
+        print("\nReturning above the writing surface...")
+        controller.move_to_home()
+        return True
+    except KeyboardInterrupt:
+        print("\nInterrupted by user")
+        return False
+    finally:
+        controller.disconnect()
+        print("\n" + "=" * 70)
+        print("Session ended")
+        print("=" * 70 + "\n")
+
+
 def test_connection(robot_ip: Optional[str] = None) -> bool:
     """Test connection and display the configured perpendicular orientation."""
     cfg = _load_franka_config()
@@ -364,19 +484,61 @@ def test_connection(robot_ip: Optional[str] = None) -> bool:
 
 
 if __name__ == "__main__":
+    import argparse
     import sys
 
-    if len(sys.argv) < 2:
-        print("Usage:")
-        print("  python RoboControl2.py <npz_file> [robot_ip] [speed]")
-        print("  python RoboControl2.py --test [robot_ip]")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description="Execute one or more NPZ calligraphy trajectories with paper-normal orientation.",
+        epilog=(
+            "Legacy single-file form is still supported:\n"
+            "  python RoboControl2.py file.npz 172.16.0.2 0.05\n\n"
+            "Multi-file form:\n"
+            "  python RoboControl2.py a.npz b.npz c.npz --robot-ip 172.16.0.2 --speed 0.05"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("args", nargs="*", help="NPZ file(s), or legacy: <npz_file> [robot_ip] [speed]")
+    parser.add_argument("--robot-ip", dest="robot_ip", default=None)
+    parser.add_argument("--speed", type=float, default=None)
+    parser.add_argument(
+        "--spacing-mm",
+        type=float,
+        default=0.0,
+        help="Offset each later NPZ along paper X by this many millimeters.",
+    )
+    parser.add_argument(
+        "--home-between",
+        action="store_true",
+        help="Move above the paper between NPZ files instead of writing continuously.",
+    )
+    parser.add_argument("--test", action="store_true", help="Only test robot connection.")
+    parsed = parser.parse_args()
 
-    if sys.argv[1] == "--test":
-        ip = sys.argv[2] if len(sys.argv) > 2 else None
+    if parsed.test:
+        legacy_ip = parsed.args[0] if parsed.args else None
+        ip = parsed.robot_ip or legacy_ip
         sys.exit(0 if test_connection(ip) else 1)
 
-    path = sys.argv[1]
-    ip = sys.argv[2] if len(sys.argv) > 2 else None
-    motion_speed = float(sys.argv[3]) if len(sys.argv) > 3 else 0.05
-    sys.exit(0 if Control(path, ip, motion_speed) else 1)
+    if not parsed.args:
+        parser.print_help()
+        sys.exit(1)
+
+    npz_paths = list(parsed.args)
+    robot_ip = parsed.robot_ip
+    motion_speed = parsed.speed if parsed.speed is not None else 0.05
+
+    # Backward compatibility: python RoboControl2.py file.npz [robot_ip] [speed]
+    if len(npz_paths) >= 2 and not npz_paths[1].lower().endswith(".npz"):
+        robot_ip = robot_ip or npz_paths[1]
+        if len(npz_paths) >= 3:
+            motion_speed = parsed.speed if parsed.speed is not None else float(npz_paths[2])
+        npz_paths = [npz_paths[0]]
+
+    success = ControlMany(
+        npz_paths,
+        robot_ip=robot_ip,
+        speed=motion_speed,
+        spacing_m=parsed.spacing_mm / 1000.0,
+        home_between=parsed.home_between,
+    )
+    sys.exit(0 if success else 1)

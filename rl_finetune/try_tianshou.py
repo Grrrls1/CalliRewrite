@@ -554,7 +554,13 @@ python try_tianshou.py   \
     --smooth_action_weight 0 \
     --smooth_theta_weight 0.01 \
     --smooth_pos_weight 0 \
-    --smooth_penalty_max 0.1
+    --smooth_penalty_max 0.1 \
+    --learn_rbf \
+    --rbf_dim 64 \
+    --rbf_sigma 0.8 \
+    --freeze_rbf_centers \
+    --concatenate_rbf 
+    
 
 python try_tianshou.py \
   --train_data_dir data/train_data/ \

@@ -56,21 +56,108 @@ def densify_polyline_3d(x, y, z, max_step_m, densify_flags=None):
     return x2, y2, z2
 
 
-def transform_unit_xy(x, y):
+def smooth_contact_z(z, pen_down, window):
+    """Moving-average Z only while the pen is down; keep pen-up heights intact."""
+    if window is None or window <= 1:
+        return list(z)
+    if window % 2 == 0:
+        raise ValueError("z_smooth_window must be odd so smoothing is centered")
+
+    z_arr = np.asarray(z, dtype=float)
+    down = np.asarray(pen_down, dtype=bool)
+    smoothed = z_arr.copy()
+    half = window // 2
+    for i in range(len(z_arr)):
+        if not down[i]:
+            continue
+        lo = max(0, i - half)
+        hi = min(len(z_arr), i + half + 1)
+        mask = down[lo:hi]
+        if np.any(mask):
+            smoothed[i] = float(np.mean(z_arr[lo:hi][mask]))
+    return smoothed.tolist()
+
+
+def simplify_polyline_for_robot(x, y, z, pen_down, min_step_m):
     """
-    Apply the coordinate transform needed for MuJoCo execution:
-    rotate 90 degrees clockwise in the unit square, flip left-right, then
-    rotate 180 degrees so the saved canvas has the same orientation as the
-    source character.
+    Drop points closer than min_step_m while preserving endpoints and pen state changes.
+
+    This is intended for blocking robot controllers where thousands of tiny
+    segments cause start-stop jitter.
+    """
+    if min_step_m is None:
+        return list(x), list(y), list(z), list(pen_down)
+    if min_step_m <= 0:
+        raise ValueError(f"min_step_m must be > 0, got {min_step_m}")
+    if len(x) != len(y) or len(y) != len(z) or len(z) != len(pen_down):
+        raise ValueError("x/y/z/pen_down length mismatch")
+    if len(x) < 3:
+        return list(x), list(y), list(z), list(pen_down)
+
+    keep = [0]
+    last_kept = np.asarray([x[0], y[0], z[0]], dtype=float)
+    for i in range(1, len(x) - 1):
+        state_changed = bool(pen_down[i]) != bool(pen_down[i - 1])
+        next_state_changes = bool(pen_down[i]) != bool(pen_down[i + 1])
+        point = np.asarray([x[i], y[i], z[i]], dtype=float)
+        far_enough = float(np.linalg.norm(point - last_kept)) >= min_step_m
+        if state_changed or next_state_changes or far_enough:
+            keep.append(i)
+            last_kept = point
+    keep.append(len(x) - 1)
+
+    return (
+        [float(x[i]) for i in keep],
+        [float(y[i]) for i in keep],
+        [float(z[i]) for i in keep],
+        [bool(pen_down[i]) for i in keep],
+    )
+
+
+TRANSFORM_CHOICES = (
+    "identity",
+    "rotate-cw",
+    "rotate-ccw",
+    "rotate-180",
+    "flip-x",
+    "flip-y",
+    "swap-xy",
+)
+
+
+def apply_transform_op(x, y, op):
+    """Apply one normalized unit-square coordinate transform."""
+    if op == "identity":
+        return x, y
+    if op == "rotate-cw":
+        return y, 1.0 - x
+    if op == "rotate-ccw":
+        return 1.0 - y, x
+    if op == "rotate-180":
+        return 1.0 - x, 1.0 - y
+    if op == "flip-x":
+        return 1.0 - x, y
+    if op == "flip-y":
+        return x, 1.0 - y
+    if op == "swap-xy":
+        return y, x
+    raise ValueError(f"Unknown transform op: {op}")
+
+
+def transform_unit_xy(x, y, transform_ops=None):
+    """
+    Apply a configurable coordinate transform in the normalized unit square.
 
     With image-style normalized coordinates (x right, y down), the combined
-    transform is:
-      rotate cw:       (x, y) -> (y, 1 - x)
-      flip horizontal: (x, y) -> (1 - x, y)
-      rotate 180:      (x, y) -> (1 - x, 1 - y)
-      combined:        (x, y) -> (y, x)
+    The default transform is identity; pass --transform to rotate or flip.
     """
-    return y, x
+    if transform_ops is None:
+        transform_ops = ("identity",)
+    x = float(x)
+    y = float(y)
+    for op in transform_ops:
+        x, y = apply_transform_op(x, y, op)
+    return x, y
 
 
 # ============================================================================
@@ -103,6 +190,9 @@ def convert_rl_to_npz(npy_path, output_npz_path,
                      calibration_func=func_brush_precalibrated,
                      alpha=0.04, beta=0.5, style_type=1,
                      max_step_mm=None,
+                     min_step_mm=None,
+                     z_smooth_window=1,
+                     transform_ops=None,
                      z_shallow=-0.002, z_deep=-0.004):
     """
     将RL输出的.npy文件转换为机器人控制点.npz文件
@@ -126,6 +216,9 @@ def convert_rl_to_npz(npy_path, output_npz_path,
     print(f"  数据形状: {data.shape}")
     print(f"  字符尺寸: {alpha*100} cm")
     print(f"  笔画宽度调整: {beta}")
+    if transform_ops is None:
+        transform_ops = ("identity",)
+    print(f"  坐标变换: {' -> '.join(transform_ops)}")
 
     # 读取当前RL输出里的r范围，并映射到固定下压区间。
     # r越大，笔压越深：min(r)->z_shallow，max(r)->z_deep。
@@ -155,7 +248,7 @@ def convert_rl_to_npz(npy_path, output_npz_path,
         x = float(x)
         y = float(y)
         r = float(r)
-        x, y = transform_unit_xy(x, y)
+        x, y = transform_unit_xy(x, y, transform_ops)
 
         # 缩放到实际尺寸
         x_ = x * alpha
@@ -199,7 +292,7 @@ def convert_rl_to_npz(npy_path, output_npz_path,
             if style_type == 0:
                 # 隶书：笔画起始处的回锋
                 nxt_x, nxt_y = data[i + 1, 1:3].astype(float)
-                nxt_x, nxt_y = transform_unit_xy(nxt_x, nxt_y)
+                nxt_x, nxt_y = transform_unit_xy(nxt_x, nxt_y, transform_ops)
                 nxt_vec = np.array([nxt_x, nxt_y]) - np.array([x, y])  # 归一化后计算方向
                 vec_norm = np.linalg.norm(nxt_vec)
                 if vec_norm > 0:
@@ -220,14 +313,28 @@ def convert_rl_to_npz(npy_path, output_npz_path,
         record_z.append(record_z[-1] + 0.015)
         record_pen_down.append(False)
 
-    # 可选：控制点增密（限制每段最大步长）
+    # 可选：控制点增密（限制每段最大步长）。这更适合仿真，真机通常不要开太小。
     if max_step_mm is not None:
         max_step_m = float(max_step_mm) / 1000.0
         before = len(record_x)
         record_x, record_y, record_z = densify_polyline_3d(
             record_x, record_y, record_z, max_step_m, record_pen_down
         )
+        record_pen_down = [z < 0.0 for z in record_z]
         print(f"🔧 增密: {before} → {len(record_x)} (max_step={max_step_mm}mm)")
+
+    # 真机后处理：平滑Z并减少过密点，避免逐点阻塞控制造成抖动和极慢执行。
+    if z_smooth_window and z_smooth_window > 1:
+        record_z = smooth_contact_z(record_z, record_pen_down, z_smooth_window)
+        print(f"🔧 Z平滑: contact-only moving average window={z_smooth_window}")
+
+    if min_step_mm is not None:
+        min_step_m = float(min_step_mm) / 1000.0
+        before = len(record_x)
+        record_x, record_y, record_z, record_pen_down = simplify_polyline_for_robot(
+            record_x, record_y, record_z, record_pen_down, min_step_m
+        )
+        print(f"🔧 真机简化: {before} → {len(record_x)} (min_step={min_step_mm}mm)")
 
     # 保存为npz
     np.savez(output_npz_path,
@@ -365,6 +472,11 @@ def main():
   # 自定义参数
   python convert_and_visualize.py input.npy --alpha 0.05 --beta 0.7
 
+  # 调试轨迹方向：可重复传入，按顺序执行
+  python convert_and_visualize.py input.npy -o out.npz --transform rotate-cw --transform flip-x
+  python convert_and_visualize.py input.npy -o out.npz --transform identity
+  python convert_and_visualize.py input.npy -o out.npz --transform rotate-180
+
   # 只可视化已有的npz文件
   python convert_and_visualize.py --npz existing.npz --viz output.png
         """
@@ -383,10 +495,18 @@ def main():
                        help='书法风格：0=隶书（默认），1=楷书')
     parser.add_argument('--max-step-mm', type=float, default=None,
                        help='控制点增密：限制相邻点最大3D距离（mm）。例如 0.3 会显著增加控制点数量')
+    parser.add_argument('--min-step-mm', type=float, default=None,
+                       help='真机简化：丢弃相邻距离小于该值的控制点（mm），保留抬笔/落笔边界。建议 0.6~1.2')
+    parser.add_argument('--z-smooth-window', type=int, default=1,
+                       help='真机Z平滑窗口，必须为奇数；只平滑落笔点。建议 3 或 5')
     parser.add_argument('--z-shallow', type=float, default=-0.002,
                        help='最小r对应的Z值（米），默认-0.002，即纸面下2mm')
     parser.add_argument('--z-deep', type=float, default=-0.004,
                        help='最大r对应的Z值（米），默认-0.004，即纸面下4mm')
+    parser.add_argument('--transform', action='append', choices=TRANSFORM_CHOICES,
+                       help=('坐标变换操作，可重复传入并按顺序执行。'
+                             '默认: identity。'
+                             '可选: ' + ', '.join(TRANSFORM_CHOICES)))
     parser.add_argument('--no-viz', action='store_true',
                        help='不生成可视化图片')
 
@@ -434,6 +554,8 @@ def main():
     print("=" * 70)
     print(f"输入文件: {npy_path}")
     print(f"输出NPZ: {npz_path}")
+    transform_ops = tuple(args.transform) if args.transform else ("identity",)
+    print(f"坐标变换: {' -> '.join(transform_ops)}")
     if not args.no_viz:
         print(f"可视化图: {viz_path}")
     print("=" * 70)
@@ -448,6 +570,9 @@ def main():
             beta=args.beta,
             style_type=args.style,
             max_step_mm=args.max_step_mm,
+            min_step_mm=args.min_step_mm,
+            z_smooth_window=args.z_smooth_window,
+            transform_ops=transform_ops,
             z_shallow=args.z_shallow,
             z_deep=args.z_deep
         )
