@@ -94,7 +94,7 @@ class FourierMLP(nn.Module):
         if self.concatenate_fourier:
             mlp_input_dim = kwargs['fourier_dim'] + input_dim
         else:
-            mlp_input_dim = mlp_input_dim
+            mlp_input_dim = kwargs['fourier_dim']
 
         # shape lists
         hidden_sizes = [mlp_input_dim] + list(hidden_sizes)
@@ -136,12 +136,68 @@ class FourierMLP(nn.Module):
         return self.model(ff)
 
 
+class RBFMLP(nn.Module):
+    """MLP preceded by Gaussian radial basis function features."""
+
+    def __init__(self,
+        input_dim: int,
+        output_dim: int = 0,
+        hidden_sizes: Sequence[int] = (),
+        norm_layer: Optional[Union[ModuleType, Sequence[ModuleType]]] = None,
+        norm_args: Optional[ArgsType] = None,
+        activation: Optional[Union[ModuleType, Sequence[ModuleType]]] = nn.ReLU,
+        act_args: Optional[ArgsType] = None,
+        device: Optional[Union[str, int, torch.device]] = None,
+        linear_layer: Type[nn.Linear] = nn.Linear,
+        flatten_input: bool = True,
+        **kwargs,
+    ) -> None:
+        super().__init__()
+        rbf_dim = kwargs['rbf_dim']
+        rbf_sigma = kwargs['rbf_sigma']
+        if rbf_dim <= 0:
+            raise ValueError(f"rbf_dim must be > 0, got {rbf_dim}.")
+        if rbf_sigma <= 0:
+            raise ValueError(f"rbf_sigma must be > 0, got {rbf_sigma}.")
+
+        self.device = device
+        self.flatten_input = flatten_input
+        self.rbf_sigma = rbf_sigma
+        self.concatenate_rbf = kwargs['concatenate_rbf']
+        self.centers = nn.Parameter(torch.empty(rbf_dim, input_dim).uniform_(-1.0, 1.0))
+        self.centers.requires_grad = kwargs['train_rbf_centers']
+
+        mlp_input_dim = rbf_dim + input_dim if self.concatenate_rbf else rbf_dim
+        self.model = MLP(
+            mlp_input_dim, output_dim, hidden_sizes, norm_layer, norm_args, activation,
+            act_args, device, linear_layer
+        )
+        self.output_dim = self.model.output_dim
+
+    @no_type_check
+    def forward(self, obs: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
+        if self.device is not None:
+            obs = torch.as_tensor(obs, device=self.device, dtype=torch.float32)
+        if self.flatten_input:
+            obs = obs.flatten(1)
+
+        obs_norm = torch.sum(obs ** 2, dim=-1, keepdim=True)
+        centers_norm = torch.sum(self.centers ** 2, dim=-1).unsqueeze(0)
+        squared_dist = obs_norm + centers_norm - 2 * torch.matmul(obs, self.centers.t())
+        squared_dist = squared_dist.clamp_min(0.0)
+        features = torch.exp(-squared_dist / (2 * self.rbf_sigma ** 2))
+        if self.concatenate_rbf:
+            features = torch.cat([obs, features], dim=-1)
+        return self.model(features)
+
+
 class My_MLP(nn.Module):
     """My Wrapper of MLP to support more specific DRL usage. referring to Tisnshou wrapper
 
     Only to notify:
     :param learn_fourier: default False, decide whether to transfer state into a fourier-version feature.
         https://arxiv.org/pdf/2112.03257.pdf; dim of fourier layer is picked fromhidden_sizes[0]
+    :param learn_rbf: default False, map state to Gaussian radial basis features before the MLP.
     """
     def __init__(self,
         state_shape: Union[int, Sequence[int]],
@@ -158,6 +214,7 @@ class My_MLP(nn.Module):
         dueling_param: Optional[Tuple[Dict[str, Any], Dict[str, Any]]] = None,
         linear_layer: Type[nn.Linear] = nn.Linear,
         learn_fourier: bool = False,
+        learn_rbf: bool = False,
         **kwargs,
     ) -> None:
         
@@ -172,9 +229,17 @@ class My_MLP(nn.Module):
         self.use_dueling = dueling_param is not None
         output_dim = action_dim if not self.use_dueling and not concat else 0
         
+        if learn_fourier and learn_rbf:
+            raise ValueError("learn_fourier and learn_rbf cannot both be enabled.")
+
         # modify
         if (learn_fourier):
             self.model = FourierMLP(
+            input_dim, output_dim, hidden_sizes, norm_layer, norm_args, activation,
+            act_args, device, linear_layer, **kwargs
+        )
+        elif learn_rbf:
+            self.model = RBFMLP(
             input_dim, output_dim, hidden_sizes, norm_layer, norm_args, activation,
             act_args, device, linear_layer, **kwargs
         )
@@ -201,6 +266,8 @@ class My_MLP(nn.Module):
             }
             if (learn_fourier):
                 self.Q, self.V = FourierMLP(**q_kwargs,**kwargs), FourierMLP(**v_kwargs,**kwargs)
+            elif learn_rbf:
+                self.Q, self.V = RBFMLP(**q_kwargs,**kwargs), RBFMLP(**v_kwargs,**kwargs)
             else:    
                 self.Q, self.V = MLP(**q_kwargs), MLP(**v_kwargs)
             self.output_dim = self.Q.output_dim
@@ -287,4 +354,3 @@ class My_Siren(nn.Module):
         if self.softmax:
             logits = torch.softmax(logits, dim=-1)
         return logits, state
-        

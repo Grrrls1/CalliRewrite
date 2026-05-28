@@ -83,6 +83,8 @@ class CalliEnv(gym.Env):
         smooth_theta_weight=0.02,
         smooth_pos_weight=0.02,
         smooth_penalty_max=0.1,
+        early_artifact_episodes=10,
+        artifact_episode_interval=5,
     ):  # 40 10 5
         '''
         # modify canvas width!
@@ -132,6 +134,12 @@ class CalliEnv(gym.Env):
         self.smooth_theta_weight = smooth_theta_weight
         self.smooth_pos_weight = smooth_pos_weight
         self.smooth_penalty_max = smooth_penalty_max
+        if early_artifact_episodes < 0:
+            raise ValueError("early_artifact_episodes must be >= 0.")
+        if artifact_episode_interval <= 0:
+            raise ValueError("artifact_episode_interval must be > 0.")
+        self.early_artifact_episodes = early_artifact_episodes
+        self.artifact_episode_interval = artifact_episode_interval
         self.prev_action = None
         self.prev_pos = None
         self.prev_delta_pos = None
@@ -246,6 +254,7 @@ class CalliEnv(gym.Env):
             if pt=1 after a step() call, it means a new scale (1/pt_indices[i+1]) should be adopted.
         '''
         img_path, skel_path = pick_data
+        self.current_data_id = count
         self.img_path = img_path       #renderer
         self.stroke_img = cv2.imread(self.img_path, 0)
         
@@ -370,7 +379,9 @@ class CalliEnv(gym.Env):
                                                          next_vec_x, next_vec_y, self.contours, self.graph_width) ### CAUTION: GRAPH WIDTH IS 256!!!
 
         ## re-calculate next_theta, next_vec_x and next_vec_y.
+        starts_new_stroke = False
         if next_state_0 >= 0.999:
+            starts_new_stroke = True
             next_state_0 = 0
             self.i +=1
             vec = self.skel_list[self.skel_list_cnter]-self.skel_list[self.skel_list_cnter+2]
@@ -394,8 +405,8 @@ class CalliEnv(gym.Env):
                                 next_curv, next_r_prime, next_vec_x, next_vec_y],dtype=np.float32)
         # calculate reward
         next_pos = np.array([next_x, next_y], dtype=np.float32)
-        reward = self.calc_reward(action, next_pos, next_theta, last_r, terminated)
-        self.update_smoothness_history(action, next_pos, next_theta)
+        reward = self.calc_reward(action, next_pos, next_theta, last_r, terminated, starts_new_stroke)
+        self.update_smoothness_history(action, next_pos, next_theta, starts_new_stroke)
         
         diff = self.counter - (self.counter // self.image_iter)*self.image_iter
 
@@ -407,6 +418,8 @@ class CalliEnv(gym.Env):
             self.R_list = np.concatenate((self.R_list, np.array([self.r_list[0]/2])))
             self.R_list = np.copy(self.r_list)
             self.r_list = np.empty(0)
+            if self.should_save_artifacts(self.counter):
+                self.save_current_artifacts(self.counter)
         
         #return self.state, reward, terminated, {}
         # shimmy tianshou/env/venvs.py/patch_env_generator/patched need to be modified!!
@@ -438,26 +451,8 @@ class CalliEnv(gym.Env):
         re_period = 0
         re_r_prime = 0
 
-        if self.counter % self.image_iter == 0: #record image-wise
+        if self.counter % self.image_iter == 0: #switch image-wise
             ## change environment imgs and skels
-            
-            if self.counter !=0:
-                last_id = ((self.counter-1) //self.image_iter) % self.list_num
-
-                self.control_list[last_id] = np.hstack((self.pt_list[:, np.newaxis],self.skel_list))
-                r_len = self.R_list.shape[0]
-
-                self.control_list[last_id] = np.hstack((self.control_list[last_id][:r_len, :], self.R_list[:,np.newaxis])) # 4 dim
-                self.R_list = np.empty(0)
-                
-                last_count = ((self.counter-1) // self.image_iter) % self.list_num
-                save_control_dir = os.path.join(self.output_path, str(self.start_idx+last_count)+'_'+str(self.counter)+'.npy')
-                np.save(save_control_dir, self.control_list[last_id])
-                
-                if self.visualize_path is not None:
-                    save_vis_dir = os.path.join(self.visualize_path, str(self.start_idx+last_count)+'_'+str(self.counter)+'.png')
-                    skel_utils.save_visualization(save_vis_dir,self.data_pool[last_count][0], self.control_list[last_id], None)
- 
             count = (self.counter // self.image_iter) % self.list_num
             pick_data = self.data_pool[count]
             self.load_skel_and_img(pick_data, count)
@@ -494,10 +489,37 @@ class CalliEnv(gym.Env):
             return self.state
         else:
             return self.state, {}
+
+    def should_save_artifacts(self, episode_num):
+        return (
+            episode_num <= self.early_artifact_episodes
+            or episode_num % self.artifact_episode_interval == 0
+        )
+
+    def save_current_artifacts(self, episode_num):
+        control = np.hstack((self.pt_list[:, np.newaxis], self.skel_list))
+        control = np.hstack((control[:self.R_list.shape[0], :], self.R_list[:, np.newaxis]))
+        self.control_list[self.current_data_id] = control
+
+        image_id = self.start_idx + self.current_data_id
+        filename = f"img_{image_id}_episode_{episode_num:06d}"
+        np.save(os.path.join(self.output_path, filename + ".npy"), control)
+
+        if self.visualize_path is not None:
+            skel_utils.save_visualization(
+                os.path.join(self.visualize_path, filename + ".png"),
+                self.data_pool[self.current_data_id][0],
+                control,
+                None,
+            )
+
     def circular_angle_diff_deg(self, angle_a, angle_b):
         return (float(angle_a) - float(angle_b) + 180.0) % 360.0 - 180.0
 
-    def calc_smoothness_penalty(self, action, next_pos, next_theta):
+    def calc_smoothness_penalty(self, action, next_pos, next_theta, starts_new_stroke=False):
+        if starts_new_stroke:
+            return 0.0
+
         penalty = 0.0
 
         if self.prev_action is not None and self.smooth_action_weight > 0:
@@ -505,8 +527,11 @@ class CalliEnv(gym.Env):
             penalty += self.smooth_action_weight * float(np.inner(action_delta, action_delta))
 
         if self.prev_theta_deg is not None and self.smooth_theta_weight > 0:
-            theta_delta = self.circular_angle_diff_deg(next_theta, self.prev_theta_deg) / self.theta_max
-            penalty += self.smooth_theta_weight * float(theta_delta * theta_delta)
+            theta_delta = abs(self.circular_angle_diff_deg(next_theta, self.prev_theta_deg))
+            # A normal tool update may rotate by theta_step; penalize only visible spikes.
+            theta_excess = max(0.0, theta_delta - max(float(self.theta_step), 1e-6))
+            theta_jump = theta_excess / max(float(self.theta_step), 1e-6)
+            penalty += self.smooth_theta_weight * float(theta_jump * theta_jump)
 
         if self.prev_pos is not None and self.prev_delta_pos is not None and self.smooth_pos_weight > 0:
             delta_pos = np.asarray(next_pos, dtype=np.float32) - self.prev_pos
@@ -524,18 +549,22 @@ class CalliEnv(gym.Env):
 
         return penalty
 
-    def update_smoothness_history(self, action, next_pos, next_theta):
+    def update_smoothness_history(self, action, next_pos, next_theta, starts_new_stroke=False):
         action = np.asarray(action, dtype=np.float32)
         next_pos = np.asarray(next_pos, dtype=np.float32)
-        if self.prev_pos is None:
+        if starts_new_stroke:
+            self.prev_action = None
             self.prev_delta_pos = np.zeros(2, dtype=np.float32)
         else:
-            self.prev_delta_pos = next_pos - self.prev_pos
-        self.prev_action = action.copy()
+            if self.prev_pos is None:
+                self.prev_delta_pos = np.zeros(2, dtype=np.float32)
+            else:
+                self.prev_delta_pos = next_pos - self.prev_pos
+            self.prev_action = action.copy()
         self.prev_pos = next_pos.copy()
         self.prev_theta_deg = float(next_theta)
 
-    def calc_reward(self, action, next_pos, next_theta, last_r, terminated):
+    def calc_reward(self, action, next_pos, next_theta, last_r, terminated, starts_new_stroke=False):
         '''
         IN_STEP:
             1. stroke_size
@@ -565,7 +594,7 @@ class CalliEnv(gym.Env):
         stk_pix = np.sum(tip_ds)
         
         reward -= 0.08* (1/(math.sqrt(next_r+1e-4))-0.5/math.sqrt(self.r_max))**1.5
-        # reward -= self.calc_smoothness_penalty(action, next_pos, next_theta)
+        reward -= self.calc_smoothness_penalty(action, next_pos, next_theta, starts_new_stroke)
         
         ## terminate reward:
         points, cur_r = self.calc_four_points(self.state)
